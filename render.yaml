@@ -1,0 +1,27 @@
+# render.yaml — place this in your backend root folder
+# Render reads this file automatically when you connect your GitHub repo
+
+services:
+  - type: web
+    name: marketpulse-backend
+    env: node
+    region: singapore   # closest to India — lowest latency for NSE data
+    plan: free
+
+    # ✅ Build command — installs all npm packages
+    buildCommand: npm install
+
+    # ✅ Start command — runs your server
+    startCommand: node server.js
+
+    # Environment variables — set these in Render dashboard
+    # (never hardcode API keys in code)
+    envVars:
+      - key: PORT
+        value: 10000        # Render assigns port 10000 by default
+      - key: METALS_API_KEY
+        sync: false         # means you'll enter this manually in dashboard
+
+    # ✅ Health check — Render pings this to know your server is alive
+    # Your server.js has GET /api/status which returns JSON — perfect
+    healthCheckPath: /api/status

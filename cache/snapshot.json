@@ -1,0 +1,35 @@
+{
+  "crypto": {
+    "BTCUSDT": {
+      "price": 67276.07,
+      "change": 0.598
+    },
+    "ETHUSDT": {
+      "price": 2063.39,
+      "change": 0.469
+    },
+    "SOLUSDT": {
+      "price": 80.8,
+      "change": 0.673
+    },
+    "BNBUSDT": {
+      "price": 593.49,
+      "change": 0.791
+    },
+    "XRPUSDT": {
+      "price": 1.3178,
+      "change": 0.015
+    }
+  },
+  "nifty": {
+    "price": 22713.1
+  },
+  "bankNifty": {
+    "price": 51548.75
+  },
+  "metals": {
+    "gold_24k": 14012.84,
+    "gold_22k": 12835.76,
+    "silver": 6780.66
+  }
+}
