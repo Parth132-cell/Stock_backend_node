@@ -77,6 +77,6 @@ setInterval(() => {
     await fetchBankNifty();
   };
 
-  setInterval(pollIndices, 1000);   // ✅ was 60s, now 15s
+  setInterval(pollIndices, 500);   // ✅ was 60s, now 15s
   setInterval(fetchMetals, 300000);  // Metals every 5min (API rate limit)
 })();
