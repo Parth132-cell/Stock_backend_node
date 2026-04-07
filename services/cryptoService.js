@@ -1,16 +1,4 @@
-/**
- * cryptoService.js — Fixed for Render.com deployment
- *
- * ROOT CAUSE: Binance WebSocket returns HTTP 451 (geo/datacenter block)
- * on Render's US-based servers. Binance REST API is also unreliable from
- * datacenter IPs. Solution: use CoinGecko public API (no auth, no geo block)
- * as primary, with Binance REST as secondary fallback.
- *
- * Strategy:
- *   1. Poll CoinGecko every 10s (free tier allows ~30 req/min)
- *   2. If CoinGecko fails, fall back to Binance REST
- *   3. simulatorService.js already handles stale data — no WS needed
- */
+
 
 const axios = require("axios");
 const store = require("../cache/store");
