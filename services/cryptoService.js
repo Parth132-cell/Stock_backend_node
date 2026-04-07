@@ -1,142 +1,198 @@
 /**
- * cryptoService.js — Fixed for Render.com deployment
+ * cryptoService.js — Render.com compatible (v3)
  *
- * ROOT CAUSE: Binance WebSocket returns HTTP 451 (geo/datacenter block)
- * on Render's US-based servers. Binance REST API is also unreliable from
- * datacenter IPs. Solution: use CoinGecko public API (no auth, no geo block)
- * as primary, with Binance REST as secondary fallback.
+ * WHY PREVIOUS VERSIONS FAILED:
+ *   - Binance WS  → HTTP 451 (datacenter IP geo-block)
+ *   - CoinGecko   → HTTP 429 / blocked (rate-limits datacenter IPs on free tier)
  *
- * Strategy:
- *   1. Poll CoinGecko every 10s (free tier allows ~30 req/min)
- *   2. If CoinGecko fails, fall back to Binance REST
- *   3. simulatorService.js already handles stale data — no WS needed
+ * SOLUTION — waterfall through 3 datacenter-friendly APIs:
+ *   1. Kraken REST    — no auth, no geo-block, datacenter-friendly ✅
+ *   2. Coinbase REST  — no auth, public, works from any IP ✅
+ *   3. Binance US     — separate domain (api.binance.us), less restricted ✅
+ *
+ * simulatorService.js handles stale data if all 3 fail transiently.
  */
 
 const axios = require("axios");
 const store = require("../cache/store");
 
-// Binance symbol → CoinGecko id mapping
-const COINGECKO_IDS = {
-  BTCUSDT: "bitcoin",
-  ETHUSDT: "ethereum",
-  SOLUSDT: "solana",
-  BNBUSDT: "binancecoin",
-  XRPUSDT: "ripple",
+// ─── Symbol maps ──────────────────────────────────────────────────────────────
+
+// Kraken uses XBT for Bitcoin, and its own pair naming
+const KRAKEN_PAIRS = {
+  BTCUSDT: "XBTUSD",
+  ETHUSDT: "ETHUSD",
+  SOLUSDT: "SOLUSD",
+  BNBUSDT: "BNBUSD",   // may not exist on Kraken — fallback handles it
+  XRPUSDT: "XRPUSD",
 };
 
-const symbols = Object.keys(COINGECKO_IDS);
+// Coinbase uses standard symbols
+const COINBASE_SYMBOLS = {
+  BTCUSDT: "BTC",
+  ETHUSDT: "ETH",
+  SOLUSDT: "SOL",
+  BNBUSDT: "BNB",
+  XRPUSDT: "XRP",
+};
 
-// ─── CoinGecko fetch (primary) ────────────────────────────────────────────────
-const fetchFromCoinGecko = async () => {
-  const ids = Object.values(COINGECKO_IDS).join(",");
+const ALL_SYMBOLS = Object.keys(KRAKEN_PAIRS);
+
+// ─── Source 1: Kraken ─────────────────────────────────────────────────────────
+const fetchFromKraken = async () => {
+  const pairs = Object.values(KRAKEN_PAIRS).join(",");
   const res = await axios.get(
-    `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true`,
+    `https://api.kraken.com/0/public/Ticker?pair=${pairs}`,
     { timeout: 8000 }
   );
 
-  const data = res.data;
+  if (res.data.error && res.data.error.length > 0) {
+    throw new Error(`Kraken error: ${res.data.error.join(", ")}`);
+  }
+
+  const result = res.data.result;
   let updated = 0;
 
-  for (const [sym, id] of Object.entries(COINGECKO_IDS)) {
-    if (data[id]) {
+  for (const [sym, krakenPair] of Object.entries(KRAKEN_PAIRS)) {
+    // Kraken may return the pair under a slightly different key (e.g. XXBTZUSD)
+    // So search all result keys for one that contains our pair substring
+    const matchKey = Object.keys(result).find(
+      (k) => k.includes(krakenPair) || k.includes(krakenPair.replace("USD", "ZUSD"))
+    );
+    if (!matchKey) continue;
+
+    const ticker = result[matchKey];
+    const price = parseFloat(ticker.c[0]);   // c = last trade closed [price, volume]
+    const open  = parseFloat(ticker.o);       // o = today's opening price
+    const change = open > 0 ? parseFloat((((price - open) / open) * 100).toFixed(2)) : 0;
+
+    if (price > 0) {
       store.crypto[sym] = {
-        price: parseFloat(data[id].usd.toFixed(2)),
-        change: parseFloat((data[id].usd_24h_change ?? 0).toFixed(2)),
+        price: parseFloat(price.toFixed(2)),
+        change,
       };
       updated++;
     }
   }
 
-  if (updated > 0) {
-    console.log(`✅ CoinGecko updated ${updated} symbols | BTC: ${store.crypto.BTCUSDT?.price}`);
-  }
+  console.log(`✅ Kraken updated ${updated}/${ALL_SYMBOLS.length} symbols | BTC: ${store.crypto.BTCUSDT?.price}`);
+  return updated;
 };
 
-// ─── Binance REST fetch (fallback) ───────────────────────────────────────────
-const fetchFromBinanceREST = async () => {
-  for (const sym of symbols) {
+// ─── Source 2: Coinbase ───────────────────────────────────────────────────────
+const fetchFromCoinbase = async () => {
+  let updated = 0;
+  for (const [sym, coin] of Object.entries(COINBASE_SYMBOLS)) {
+    // Skip symbols already populated by Kraken
+    if (store.crypto[sym]?.price > 0) { updated++; continue; }
     try {
-      const res = await axios.get(
-        `https://api.binance.com/api/v3/ticker/24hr?symbol=${sym}`,
-        { timeout: 6000 }
-      );
-      store.crypto[sym] = {
-        price: parseFloat(parseFloat(res.data.lastPrice).toFixed(2)),
-        change: parseFloat(parseFloat(res.data.priceChangePercent).toFixed(2)),
-      };
+      const [spotRes, statsRes] = await Promise.all([
+        axios.get(`https://api.coinbase.com/v2/prices/${coin}-USD/spot`, { timeout: 6000 }),
+        axios.get(`https://api.coinbase.com/v2/prices/${coin}-USD/historic?period=day`, { timeout: 6000 }),
+      ]);
+      const price = parseFloat(spotRes.data?.data?.amount ?? 0);
+      // Compute 24h change from historic open if available
+      const prices = statsRes.data?.data?.prices;
+      const open = prices && prices.length > 0 ? parseFloat(prices[prices.length - 1].price) : 0;
+      const change = open > 0 ? parseFloat((((price - open) / open) * 100).toFixed(2)) : 0;
+
+      if (price > 0) {
+        store.crypto[sym] = { price: parseFloat(price.toFixed(2)), change };
+        updated++;
+      }
     } catch (e) {
-      // silently skip — simulatorService will cover stale symbols
+      // silently skip this symbol — next source will cover it
     }
   }
-  console.log(`✅ Binance REST fallback | BTC: ${store.crypto.BTCUSDT?.price}`);
+  console.log(`✅ Coinbase covered ${updated} symbols | BTC: ${store.crypto.BTCUSDT?.price}`);
+  return updated;
+};
+
+// ─── Source 3: Binance US (fallback) ─────────────────────────────────────────
+// api.binance.us is the US-regulated endpoint — less geo-restricted than .com
+const fetchFromBinanceUS = async () => {
+  let updated = 0;
+  for (const sym of ALL_SYMBOLS) {
+    if (store.crypto[sym]?.price > 0) { updated++; continue; }
+    try {
+      const res = await axios.get(
+        `https://api.binance.us/api/v3/ticker/24hr?symbol=${sym}`,
+        { timeout: 6000 }
+      );
+      const price = parseFloat(parseFloat(res.data.lastPrice).toFixed(2));
+      const change = parseFloat(parseFloat(res.data.priceChangePercent).toFixed(2));
+      if (price > 0) {
+        store.crypto[sym] = { price, change };
+        updated++;
+      }
+    } catch (e) {
+      // silently skip
+    }
+  }
+  console.log(`✅ Binance US covered ${updated} symbols | BTC: ${store.crypto.BTCUSDT?.price}`);
+  return updated;
+};
+
+// ─── Waterfall: try all 3 sources, stop when all symbols populated ────────────
+const fetchAllCrypto = async (label = "poll") => {
+  const allPopulated = () =>
+    ALL_SYMBOLS.every((s) => store.crypto[s]?.price > 0);
+
+  // Source 1: Kraken
+  try {
+    await fetchFromKraken();
+  } catch (e) {
+    console.warn(`⚠️  [${label}] Kraken failed: ${e.message}`);
+  }
+  if (allPopulated()) return;
+
+  // Source 2: Coinbase (fills gaps Kraken missed, e.g. BNB)
+  try {
+    await fetchFromCoinbase();
+  } catch (e) {
+    console.warn(`⚠️  [${label}] Coinbase failed: ${e.message}`);
+  }
+  if (allPopulated()) return;
+
+  // Source 3: Binance US (last resort)
+  try {
+    await fetchFromBinanceUS();
+  } catch (e) {
+    console.warn(`⚠️  [${label}] Binance US failed: ${e.message}`);
+  }
+
+  if (!allPopulated()) {
+    const missing = ALL_SYMBOLS.filter((s) => !(store.crypto[s]?.price > 0));
+    console.error(`❌ [${label}] Still missing: ${missing.join(", ")} — simulator will cover`);
+  }
 };
 
 // ─── Initial load ─────────────────────────────────────────────────────────────
 const fetchInitialCrypto = async () => {
   console.log("⏳ Loading initial crypto prices...");
+  await fetchAllCrypto("init");
 
-  // Try CoinGecko first
-  try {
-    await fetchFromCoinGecko();
-    if (store.crypto.BTCUSDT?.price) {
-      console.log("✅ Initial crypto loaded via CoinGecko");
-      return;
-    }
-  } catch (e) {
-    console.warn("⚠️  CoinGecko initial load failed:", e.message);
-  }
-
-  // Fallback to Binance REST
-  try {
-    await fetchFromBinanceREST();
-    if (store.crypto.BTCUSDT?.price) {
-      console.log("✅ Initial crypto loaded via Binance REST");
-      return;
-    }
-  } catch (e) {
-    console.warn("⚠️  Binance REST initial load failed:", e.message);
-  }
-
-  // Last resort: seed with zeros so Flutter doesn't get null
-  for (const sym of symbols) {
+  // Seed zeros only as absolute last resort so Flutter never gets null
+  for (const sym of ALL_SYMBOLS) {
     if (!store.crypto[sym]) {
       store.crypto[sym] = { price: 0, change: 0 };
     }
   }
-  console.error("❌ All crypto sources failed — seeded with zeros");
+
+  const btc = store.crypto.BTCUSDT?.price;
+  if (btc > 0) {
+    console.log(`✅ Initial crypto loaded | BTC: ${btc}`);
+  } else {
+    console.error("❌ Initial crypto failed — all sources blocked. Simulator will animate prices.");
+  }
 };
 
-// ─── Polling loop (replaces WebSocket) ───────────────────────────────────────
-// NOTE: startCryptoWS is kept as the export name so server.js needs NO changes
-let _coinGeckoFailCount = 0;
-
+// ─── Polling loop (replaces Binance WebSocket) ───────────────────────────────
+// Export name kept as startCryptoWS so server.js needs zero changes.
 const startCryptoWS = () => {
-  console.log("🔄 Starting crypto polling (CoinGecko primary, Binance REST fallback)");
-
-  const poll = async () => {
-    try {
-      await fetchFromCoinGecko();
-      _coinGeckoFailCount = 0; // reset on success
-    } catch (e) {
-      _coinGeckoFailCount++;
-      console.warn(`⚠️  CoinGecko poll failed (${_coinGeckoFailCount}x): ${e.message}`);
-
-      // After 3 consecutive CoinGecko failures, try Binance REST
-      if (_coinGeckoFailCount >= 3) {
-        try {
-          await fetchFromBinanceREST();
-          // Don't reset failCount — keep trying CoinGecko next time
-        } catch (e2) {
-          console.error("❌ Binance REST fallback also failed:", e2.message);
-          // simulatorService.js will keep prices moving — no action needed
-        }
-      }
-    }
-  };
-
-  // Poll every 10 seconds
-  // CoinGecko free tier: ~30 req/min. 1 req/10s = 6 req/min — well within limit.
-  setInterval(poll, 10_000);
+  console.log("🔄 Starting crypto polling (Kraken → Coinbase → Binance US)");
+  // Poll every 15s — safe for all three free-tier APIs
+  setInterval(() => fetchAllCrypto("poll"), 15_000);
 };
 
 module.exports = { startCryptoWS, fetchInitialCrypto };
