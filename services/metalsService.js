@@ -2,7 +2,7 @@ const axios = require("axios");
 const store = require("../cache/store");
 
 // ✅ NEW API: metalpriceapi.com
-const API_KEY = "b25e40faa9f5bea375cb09ffd0738aa9";
+const API_KEY = process.env.METALS_API_KEY;
 
 // USD/INR fallback rate in case INR is not in the response
 const FALLBACK_USD_INR = 84.5;
